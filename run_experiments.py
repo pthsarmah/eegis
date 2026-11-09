@@ -10,7 +10,8 @@ from sklearn.preprocessing import StandardScaler
 
 from bands import make_layers
 from data_loader import CLASS_NAMES, load_eight_class
-from ensemble import make_ensemble, select_knn_k
+from ensemble import (fit_weighted_ensemble, predict_weighted_ensemble,
+                      select_features, select_knn_k, make_models)
 from features import extract_features
 
 
@@ -41,6 +42,9 @@ def main():
     parser.add_argument("--cache", default=".cache/features-8class.npy")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cv-folds", type=int, default=5)
+    parser.add_argument("--max-features", type=int, default=512)
+    parser.add_argument("--production-k", type=int, default=5,
+                        help="k used by the production ensemble; default 5")
     args = parser.parse_args()
 
     print(f"[run] loading eight-class data from {args.data}", flush=True)
@@ -57,22 +61,33 @@ def main():
         indices, test_size=.2, stratify=labels, random_state=args.seed)
     x = features.reshape(len(features), -1)
     scaler = StandardScaler().fit(x[train])
-    x_train, x_test = scaler.transform(x[train]), scaler.transform(x[test])
+    x_train_full, x_test_full = scaler.transform(x[train]), scaler.transform(x[test])
+    selector, x_train = select_features(
+        x_train_full, labels[train], max_features=args.max_features)
+    x_test = selector.transform(x_test_full)
+    print(f"[run] selected {x_train.shape[1]} of {x.shape[1]} features", flush=True)
 
     print("[run] selecting kNN k with stratified cross-validation", flush=True)
     k, cv_curve = select_knn_k(
         x_train, labels[train], seed=args.seed, folds=args.cv_folds)
     print(f"[run] elbow k={k}; CV curve={cv_curve}", flush=True)
 
-    ensemble, models = make_ensemble(k, args.seed)
-    print("[run] fitting 10-model hard-voting ensemble", flush=True)
-    ensemble.fit(x_train, labels[train])
-    prediction = ensemble.predict(x_test)
+    production_k = max(5, args.production_k)
+    models = make_models(production_k, args.seed)
+    print("[run] fitting validation-weighted soft ensemble", flush=True)
+    fitted, weights, model_scores = fit_weighted_ensemble(
+        models, x_train, labels[train], args.cv_folds, args.seed,
+        cv_x=x_train_full, selector_k=x_train.shape[1])
+    prediction = predict_weighted_ensemble(fitted, weights, x_test)
     result = metrics(labels[test], prediction)
     result.update({
         "class_names": CLASS_NAMES,
         "model_names": [name for name, _ in models],
-        "knn_k": k,
+        "model_cv_scores": model_scores,
+        "model_weights": weights,
+        "feature_count": int(x_train.shape[1]),
+        "knn_k_cv_selected": k,
+        "knn_k_production": production_k,
         "knn_cv_curve": cv_curve,
         "train_size": len(train),
         "test_size": len(test),
